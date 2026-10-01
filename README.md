@@ -144,68 +144,151 @@ E1000 NIC · ~20 GB populated after import.
 
 ## Network isolation
 
-### Host virtual networks
+**Status: built 2026-09-30.** Host segment created, both guests moved off NAT.
+Guest-side addressing and INetSim still to do — see "Remaining guest setup" below.
 
-| Adapter | Type | Subnet |
-|---|---|---|
-| `vmnet1` | Host-only | 172.16.204.0/24 |
-| `vmnet8` | NAT | 192.168.234.0/24 |
+### Design
 
-### ⚠️ Current state — needs changing
+```
+        ┌─────────────────────────────────────────┐
+        │  vmnet2 — 10.0.66.0/24                  │
+        │  no host adapter · no DHCP · no NAT     │
+        │                                         │
+        │   FlareVM ──────────── REMnux           │
+        │   10.0.66.10          10.0.66.2         │
+        │   gw/DNS 10.0.66.2    INetSim + tcpdump │
+        └─────────────────────────────────────────┘
+                                   │
+                          eth1 (NAT) — DISCONNECTED
+                          maintenance only
+```
 
-**Both VMs ship on NAT (`vmnet8`) and have working internet egress through the host.**
-The REMnux OVF defaults to NAT, and FlareVM was left on it.
+`vmnet2` is a pure isolated switch. Because `VNET_2_VIRTUAL_ADAPTER` is `no`, the
+Fedora host has **no interface on it at all** — the host cannot reach the guests and
+the guests cannot reach the host. No DHCP server runs on it, so there is also no
+VMware `dhcpd` on the segment to fingerprint or leak host information.
 
-A Windows 11 detonation box with NAT egress will let anything you run reach the
-internet. That means second-stage payload retrieval, C2 check-in, and your home IP
-appearing in the operator's logs.
+### Host configuration
 
-### Target state
+Appended to `/etc/vmware/networking` (original backed up alongside it):
 
-Move both guests off NAT before any sample is introduced:
+```
+answer VNET_2_HOSTONLY_NETMASK 255.255.255.0
+answer VNET_2_HOSTONLY_SUBNET  10.0.66.0
+answer VNET_2_VIRTUAL_ADAPTER  no
+answer VNET_2_DHCP             no
+```
+
+Applied with:
 
 ```bash
-# in each .vmx, replace:
-#   ethernet0.connectionType = "nat"
-# with:
-#   ethernet0.connectionType = "custom"
-#   ethernet0.vnet = "/dev/vmnet2"
+sudo vmware-networks --stop && sudo vmware-networks --start
 ```
 
-Edit while the VM is powered off, or use **VM → Settings → Network Adapter → Custom**.
+Subnet chosen to avoid collision with the host LAN (`192.168.1.0/24`), `vmnet1`
+(`172.16.204.0/24`) and `vmnet8` (`192.168.234.0/24`).
 
-Preferred design is a fully isolated segment (`vmnet2`, created with no host virtual
-adapter and no DHCP) with REMnux dual-homed as the only gateway:
+### Guest NIC configuration
+
+| | FlareVM | REMnux |
+|---|---|---|
+| `ethernet0.connectionType` | `custom` | `custom` |
+| `ethernet0.vnet` | `/dev/vmnet2` | `/dev/vmnet2` |
+| `ethernet0.startConnected` | `TRUE` | `TRUE` |
+| `ethernet1` | — | NAT, `startConnected = FALSE` |
+
+REMnux's second NIC exists so the box can be updated without rebuilding the lab.
+It is **disconnected at power-on** and must be attached by hand. Detach it again
+before any sample is introduced.
+
+### Remaining guest setup
+
+Nothing below has been done yet — it has to happen inside the running VMs.
+
+**REMnux** — static address on the isolated segment:
+
+```bash
+sudo nmcli con add type ethernet ifname ens33 con-name lab \
+  ipv4.method manual ipv4.addresses 10.0.66.2/24
+sudo nmcli con up lab
+```
+
+No gateway is set, deliberately. Confirm the interface name with `ip -br link` first.
+
+Keep IP forwarding **off** so traffic cannot route out even if `eth1` is attached:
+
+```bash
+sudo sysctl -w net.ipv4.ip_forward=0
+```
+
+**INetSim** — fake DNS/HTTP/HTTPS/SMTP/IRC so samples believe they have connectivity.
+In `/etc/inetsim/inetsim.conf`:
 
 ```
-FlareVM ── vmnet2 (isolated) ── REMnux ── (optionally) vmnet1
-                                   │
-                              INetSim + tcpdump
+service_bind_address  10.0.66.2
+dns_default_ip        10.0.66.2
 ```
 
-REMnux runs INetSim to fake DNS/HTTP/HTTPS/SMTP/IRC so the sample believes it has
-connectivity, while full PCAP is captured. Nothing reaches the real network.
+Start it with `sudo systemctl start inetsim`. Capture alongside it:
 
-Verify isolation from the Windows guest before trusting it — confirm it cannot reach
-the LAN gateway or any public address.
+```bash
+sudo tcpdump -i ens33 -w /cases/$(date +%F-%H%M).pcap
+```
 
----
+**FlareVM** — static address pointing at REMnux for both gateway and DNS:
+
+```
+IP       10.0.66.10
+Netmask  255.255.255.0
+Gateway  10.0.66.2
+DNS      10.0.66.2
+```
+
+### Verify isolation before trusting it
+
+From FlareVM, all three must fail:
+
+```
+ping 192.168.1.1        # host LAN gateway
+ping 8.8.8.8            # public internet
+ping 192.168.234.1      # vmnet8 NAT gateway
+```
+
+And this must succeed:
+
+```
+ping 10.0.66.2          # REMnux
+```
+
+Re-run this check after any Workstation upgrade — upgrades have been known to reset
+network settings.
 
 ## Operating rules
 
 **Snapshots.** Snapshot clean before every run, revert after every run. Never analyze
 on top of a dirty VM. FlareVM has `Snapshot1` as its baseline.
 
-**No host integration.** Disable shared folders, clipboard sharing, and drag-and-drop
-on the analysis guests. They are both a VM-detection artifact and an escape surface.
-Workstation enables copy/paste and drag-drop by default — turn them off explicitly in
-the `.vmx`:
+**No host integration.** Shared folders, clipboard sharing and drag-and-drop are
+disabled on the analysis guests. They are both a VM-detection artifact and an escape
+surface. Workstation enables copy/paste and drag-drop by default, so these are set
+explicitly in the `.vmx` — **applied 2026-09-30**:
+
+FlareVM (detonation box — everything off):
 
 ```
-isolation.tools.copy.disable = "TRUE"
+isolation.tools.copy.disable  = "TRUE"
 isolation.tools.paste.disable = "TRUE"
-isolation.tools.dnd.disable = "TRUE"
+isolation.tools.dnd.disable   = "TRUE"
+isolation.tools.hgfs.disable  = "TRUE"
+sharedFolder.maxNum           = "0"
+```
+
+REMnux (analysis box — shared folders off, clipboard left on so hashes and strings
+can be copied out):
+
+```
 isolation.tools.hgfs.disable = "TRUE"
+sharedFolder.maxNum          = "0"
 ```
 
 **Sample transfer.** Move samples in over a read-only ISO built on the host, or pull
